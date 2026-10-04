@@ -1,0 +1,122 @@
+Network Intrusion Detection Write-Up
+Kayla Teekaram
+1. Data Preprocessing
+The dataset arrived split across three CSV files (m_1.csv, m_2.csv, m_3.csv), each containing
+network traffic logs with 80 feature columns and a Label column. After concatenating the files,
+the following issues were identified and cleaned up in order:
+• Duplicate header rows: Because the original large CSV was split into three files, some
+rows contained the literal string 'Label' in the Label column. These were removed before
+any numeric conversion.
+• Non-numeric Timestamp column: The Timestamp column contained date/time strings
+that could not be converted to numbers, so it was dropped entirely.
+• Mixed-type feature columns: All remaining feature columns were cast to numeric using
+pd.to_numeric with errors='coerce'. Values that could not be parsed became NaN and
+were handled in the next step.
+• Sentinel value -1: Certain columns used -1 as a placeholder for missing data rather than
+NaN. These were replaced with NaN for consistent handling.
+• Infinite values: Columns like flow bytes per second contained positive and negative
+infinity from division by near-zero durations. These were replaced with NaN.
+• Row-level NaN drop: After all replacements, any row still containing NaN was dropped
+entirely.
+• Zero-variance columns: Columns with a standard deviation of zero were removed since
+they carry no information and can cause issues with StandardScaler.
+An important finding emerged from the preprocessing audit: the DDOS attack-LOIC-UDP class,
+which made up roughly 0.05% of the raw data, was completely removed during the NaN/infinity
+cleanup. Because those records disproportionately contained missing and infinite values, every
+single one was dropped. As a result, only 6 of the original 7 classes survived into the modeling
+stage, and the DNN was trained and evaluated as a 6-class classifier.
+Feature scaling was applied using StandardScaler, fit only on the training split and then applied
+to the test split. This prevents data leakage. The scaler zero-centers each feature and normalizes
+variance, which is essential for Neural Network stability. Both tasks used an 80/20 stratified
+train/test split (random_state=42) to preserve class proportions in both sets.
+2. Confusion Matrix Graphs
+Task 1 — Random Forest Binary Confusion Matrix
+The
+Random Forest produced near-perfect separation between Benign and Attack traffic. The matrix
+shows 224,765 true Benign predictions, 142,025 true Attack predictions, only 1 Benign sample
+misclassified as Attack, and 0 Attack samples misclassified as Benign. False negatives (attacks
+labeled as Benign) are the most operationally dangerous outcome in an IDS context, and the
+model produced none.
+Task 2 — DNN Multi-Class Confusion Matrix
+The 6x6 matrix shows strong performance on high-frequency classes (Benign, DDOS-HOIC,
+SSH-Bruteforce) with near-perfect diagonal counts. The most notable off-diagonal activity is in
+DoS attacks-SlowHTTPTest and FTP-BruteForce, which had lower recall (0.92 and 0.41
+respectively), indicating the model confused some of those samples with other classes.
+3. Precision, Recall, and F1-Score
+Task 1 — Random Forest (Binary)
+Class Precision Recall F1-Score Support
+Benign (0) 1.00 1.00 1.00 224,766
+Attack (1) 1.00 1.00 1.00 142,025
+Accuracy 1.00 366,791
+Macro Avg 1.00 1.00 1.00 366,791
+Weighted Avg 1.00 1.00 1.00 366,791
+Task 2 — DNN Multi-Class (6 classes after preprocessing)
+Class Precision Recall F1-Score Support
+Benign 1.00 1.00 1.00 224,766
+DDOS attack-HOIC 1.00 1.00 1.00 32,750
+DoS attacks-Hulk 1.00 1.00 1.00 5,109
+DoS attacks-SlowHTTPTest 0.53 0.92 0.67 27,978
+FTP-BruteForce 0.87 0.41 0.56 38,671
+SSH-Bruteforce 1.00 1.00 1.00 37,517
+Accuracy 0.93 366,791
+Macro Avg 0.90 0.89 0.87 366,791
+Weighted Avg 0.95 0.93 0.93 366,791
+4. DNN Hyperparameters
+Hyperparameter Value
+Input dimensions Number of features remaining after preprocessing (set automatically)
+Hidden layer 1 128 neurons
+Hidden layer 2 64 neurons
+Output layer 6 neurons (one per class)
+Dropout rate 0.3 — applied after the first hidden layer
+Activation function ReLU — applied after each hidden layer
+Loss function CrossEntropyLoss with class weights (balanced)
+Optimizer Adam, learning rate = 0.001
+Batch size 512
+Epochs 50
+Train / test split 80% / 20%, stratified
+Random seed 42
+5. Class Imbalance — DDOS attack-LOIC-UDP
+The DDOS attack-LOIC-UDP class made up approximately 0.05% of the raw dataset, around
+100 records out of roughly 200,000 total. Because these records disproportionately contained
+infinite flow-rate values and missing fields, every single one was removed during the
+NaN/infinity cleanup step. The preprocessing audit cell in the notebook confirmed this explicitly
+— the encoder learned only 6 classes, and LOIC-UDP was completely absent from both the
+encoder and the label distribution after preprocessing.
+This means the DNN's reported metrics — accuracy, precision, recall, and F1 — do not reflect
+any performance on LOIC-UDP whatsoever. A deployed version of this model would be
+completely blind to that attack type. The macro-averaged F1 of 0.87 also looks better than it
+would have if LOIC-UDP had survived, since the hardest class to detect is missing from the
+evaluation entirely.
+For the 6 classes that did survive, compute_class_weight('balanced') was applied to the
+CrossEntropyLoss to give rarer classes a stronger gradient signal during training. This helped
+improve recall on classes like DoS-SlowHTTPTest (4.45% of data), though FTP-BruteForce still
+showed lower recall at 0.41, suggesting it was frequently confused with other attack types.
+6. AI Discussion & Verification
+AI coding tools were used to help generate boilerplate code, particularly for the PyTorch
+DataLoader setup, training loop structure, and seaborn heatmap formatting. All AI-generated
+code was reviewed before use. One correction was needed.
+When generating the DNN architecture, the AI produced a final output layer followed by
+nn.Softmax(dim=1), which was then passed into nn.CrossEntropyLoss. This is incorrect.
+PyTorch's CrossEntropyLoss already applies log-softmax internally before computing the
+negative log-likelihood. Applying softmax before the loss function means the model computes
+log(softmax(softmax(logits))), which double-applies the normalization, compresses all outputs
+toward uniformity, and causes gradients to vanish or become NaN. The model would fail to learn
+anything meaningful.
+The AI-generated (incorrect) code looked like this:
+# INCORRECT — softmax applied before CrossEntropyLoss
+self.network = nn.Sequential(
+ nn.Linear(128, 64), nn.ReLU(),
+ nn.Linear(64, num_classes),
+ nn.Softmax(dim=1) # <-- wrong
+)
+criterion = nn.CrossEntropyLoss()
+The corrected version removes the Softmax and passes raw logits directly to the loss function:
+# CORRECT — raw logits, CrossEntropyLoss handles softmax internally
+self.network = nn.Sequential(
+ nn.Linear(128, 64), nn.ReLU(),
+ nn.Linear(64, num_classes) # raw logits only
+)
+criterion = nn.CrossEntropyLoss(weight=class_weights_tensor)
+This was verified using the official PyTorch documentation, which states that CrossEntropyLoss
+is equivalent to combining LogSoftmax and NLLLoss. The fix was confirmed by observing that
+the training loss decreased smoothly from the first epoch with no NaN values in the loss curve.
